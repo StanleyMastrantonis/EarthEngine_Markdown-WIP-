@@ -1,0 +1,622 @@
+---
+title: "RGEE"
+author: "Stanley Mastrantonis"
+date: "20/07/2021"
+output: html_document
+---
+
+```{r setup, echo = FALSE}
+# knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+reticulate::use_python("C:/Python39/python.exe", required = TRUE)
+reticulate::py_config()
+library(reticulate)
+library(rgee)
+library(mapview)
+```
+
+```{r, functions, echo = FALSE}
+numDays = function(month,year){
+  as.numeric(strftime(as.Date(paste(year+month%/%12,month%%12+1,"01",sep="-"))-1,"%d"))
+}
+
+```
+
+
+
+```{python import, echo = FALSE}
+import tensorflow as tf
+import keras as k
+
+```
+
+```{r ee initialize}
+ee_Initialize()
+```
+
+
+```{r WD study area}
+WD = st_read("D:/OFWD Project/Data/Spatial Data/Geoscience AU(Catchment + Surface Water)/Non-GDB Shapefiles/Catchments WA/Warren & Donnelly River Catchments/Warren_Donnelly_UTM_Diss.shp") %>% sf_as_ee()
+
+cpes = st_read("D:/OFWD Project/Data/Spatial Data/Cadastral Data/Agricultural Parcels/CPES_DPIRD.shp") %>% sf_as_ee()
+
+centroid = st_read("D:/OFWD Project/Data/Spatial Data/Geoscience AU(Catchment + Surface Water)/Non-GDB Shapefiles/Catchments WA/Warren & Donnelly River Catchments/WD_centroid.shp") %>% sf_as_ee()
+```
+
+```{r plot study area}
+Map$addLayer(WD)+
+Map$addLayer(cpes) 
+
+```
+
+```{r vis param, echo = false}
+rgbvis = list(bands = c('B4', 'B3', 'B2'), min = 300, max = 1600)
+vis = list(bands=c('B4', 'B3', 'B2'), min=0, max=2500)
+falsevis = list(bands = c('B8', 'B3', 'B2'), min = 300, max = 3000)
+cloudvis = list(bands = 'probability', min = 0, max = 100)
+qavis = list(bands = 'QA60', min = 0, max = 1600)
+```
+
+
+```{r EE 01/2021}
+
+s2_sr_jan_2021 = ee$ImageCollection('COPERNICUS/S2_SR')$
+  filterBounds(WD)$
+  filterDate('2021-01-01', '2021-01-31')$
+  filter(ee$Filter$lt('CLOUD_COVERAGE_ASSESSMENT', 5))
+
+median_comp_jan_2021  = s2_sr_jan_2021$median()
+
+median_comp_jan_2021_WD= median_comp_jan_2021$clipToCollection(WD)
+median_comp_jan_2021_cpes = median_comp_jan_2021$clipToCollection(cpes)
+
+Map$addLayer(median_comp_jan_2021_WD, rgbvis, 'median')+
+Map$addLayer(median_comp_jan_2021_cpes, falsevis, 'median')
+Map$centerObject(WD$geometry())
+```
+```{python, EE 01/2021}
+import os
+import ee
+import fiona 
+import geemap
+import geetools
+
+
+
+shp = fiona.open("D:/OFWD Project/Data/Spatial Data/Geoscience AU(Catchment + Surface Water)/Non-GDB Shapefiles/Catchments WA/Warren & Donnelly River Catchments/Warren_Donnelly_WGS_Diss.shp")
+
+geom = shp.bounds
+geom_list = list(geom)
+
+AOI = geemap.shp_to_ee("D:/OFWD Project/Data/Spatial Data/Geoscience AU(Catchment + Surface Water)/Non-GDB Shapefiles/Catchments WA/Warren & Donnelly River Catchments/Warren_Donnelly_WGS_Diss.shp")
+
+
+START_DATE = '2021-01-01'
+END_DATE = '2021-03-31'
+CLOUD_FILTER = 60
+CLD_PRB_THRESH = 50
+NIR_DRK_THRESH = 0.15
+CLD_PRJ_DIST = 1
+BUFFER = 50
+
+def get_s2_sr_cld_col(AOI, START_DATE, END_DATE):
+    # Import and filter S2 SR.
+    s2_sr_col = (ee.ImageCollection('COPERNICUS/S2_SR')
+        .filterBounds(AOI)
+        .filterDate(START_DATE, END_DATE)
+        .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER)))
+    # Import and filter s2cloudless.
+    s2_cloudless_col = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+        .filterBounds(AOI)
+        .filterDate(START_DATE, END_DATE))
+    # Join the filtered s2cloudless collection to the SR collection by the 'system:index' property.
+    return ee.ImageCollection(ee.Join.saveFirst('s2cloudless').apply(**{
+        'primary': s2_sr_col,
+        'secondary': s2_cloudless_col,
+        'condition': ee.Filter.equals(**{
+            'leftField': 'system:index',
+            'rightField': 'system:index'
+        })
+    }))
+
+
+s2_sr_cld_col_eval = get_s2_sr_cld_col(AOI, START_DATE, END_DATE)
+
+
+def add_cloud_bands(img):
+    # Get s2cloudless image, subset the probability band.
+    cld_prb = ee.Image(img.get('s2cloudless')).select('probability')
+    # Condition s2cloudless by the probability threshold value.
+    is_cloud = cld_prb.gt(CLD_PRB_THRESH).rename('clouds')
+    # Add the cloud probability layer and cloud mask as image bands.
+    return img.addBands(ee.Image([cld_prb, is_cloud]))
+
+def add_shadow_bands(img):
+    # Identify water pixels from the SCL band.
+    not_water = img.select('SCL').neq(6)
+    # Identify dark NIR pixels that are not water (potential cloud shadow pixels).
+    SR_BAND_SCALE = 1e4
+    dark_pixels = img.select('B8').lt(NIR_DRK_THRESH*SR_BAND_SCALE).multiply(not_water).rename('dark_pixels')
+    # Determine the direction to project cloud shadow from clouds (assumes UTM projection).
+    shadow_azimuth = ee.Number(90).subtract(ee.Number(img.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+    # Project shadows from clouds for the distance specified by the CLD_PRJ_DIST input.
+    cld_proj = (img.select('clouds').directionalDistanceTransform(shadow_azimuth, CLD_PRJ_DIST*10)
+        .reproject(**{'crs': img.select(0).projection(), 'scale': 100})
+        .select('distance')
+        .mask()
+        .rename('cloud_transform'))
+    # Identify the intersection of dark pixels with cloud shadow projection.
+    shadows = cld_proj.multiply(dark_pixels).rename('shadows')
+    # Add dark pixels, cloud projection, and identified shadows as image bands.
+    return img.addBands(ee.Image([dark_pixels, cld_proj, shadows]))
+
+def add_cld_shdw_mask(img):
+    # Add cloud component bands.
+    img_cloud = add_cloud_bands(img)
+    # Add cloud shadow component bands.
+    img_cloud_shadow = add_shadow_bands(img_cloud)
+    # Combine cloud and shadow mask, set cloud and shadow as value 1, else 0.
+    is_cld_shdw = img_cloud_shadow.select('clouds').add(img_cloud_shadow.select('shadows')).gt(0)
+    # Remove small cloud-shadow patches and dilate remaining pixels by BUFFER input.
+    # 20 m scale is for speed, and assumes clouds don't require 10 m precision.
+    is_cld_shdw = (is_cld_shdw.focal_min(2).focal_max(BUFFER*2/20)
+        .reproject(**{'crs': img.select([0]).projection(), 'scale': 20})
+        .rename('cloudmask'))
+    # Add the final cloud-shadow mask to the image.
+    return img_cloud_shadow.addBands(is_cld_shdw)
+
+
+
+s2_sr_cld_col_eval_disp = s2_sr_cld_col_eval.map(add_cld_shdw_mask)
+
+img = s2_sr_cld_col_eval_disp.mosaic()
+
+    # Subset layers and prepare them for display.
+clouds = img.select('clouds').selfMask()
+shadows = img.select('shadows').selfMask()
+dark_pixels = img.select('dark_pixels').selfMask()
+probability = img.select('probability')
+cloudmask = img.select('cloudmask').selfMask()
+cloud_transform = img.select('cloud_transform')
+
+s2_sr_cld_col = get_s2_sr_cld_col(AOI, START_DATE, END_DATE)
+
+def apply_cld_shdw_mask(img):
+    # Subset the cloudmask band and invert it so clouds/shadow are 0, else 1.
+    not_cld_shdw = img.select('cloudmask').Not()
+    # Subset reflectance bands and update their masks, return the result.
+    return img.select('B.*').updateMask(not_cld_shdw)
+
+
+s2_sr_median = (s2_sr_cld_col.map(add_cld_shdw_mask)
+                             .map(apply_cld_shdw_mask)
+                             .median())
+                             
+# s2_sr_median_clip = s2_sr_median.clip(AOI)
+# QA60 = s2_sr_jan_2021.select(['QA60'])
+# 
+# fclouds = geetools.cloud_mask.sentinel2()
+# masked = fclouds(s2_sr_jan_2021.median())
+
+# task = geetools.batch.Export.image.toDrive(
+#             image=masked_layer,
+#             folder='MyFolder',
+#             scale=30,
+#             )
+# task.start()
+
+
+````
+
+
+```{r, results = hold}
+clouds  = py_to_r(py$clouds)
+cloudmask = py_to_r(py$cloudmask)
+shadows = py_to_r(py$shadows)
+img =  py_to_r(py$img)
+# sr_jan_2021 = py_to_r(py$s2_sr_jan_2021)
+jan_2021_cloudfree = py_to_r(py$s2_sr_median)
+jan_2021_cloudfree_clip = jan_2021_cloudfree$clip(WD)
+jan_2021_cloudfree_reduce = jan_2021_cloudfree_clip
+
+# Map$addLayer(jan_2021_cloudfree_clip, rgbvis, 'S2SR Cloud Free Composite')+
+# Map$addLayer(jan_2021_cloudfree_clip, falsevis, 'S2SR Cloud Free False Colour')
+# Map$centerObject(WD$geometry())
+
+
+Map$addLayer(clouds, visParams = list(palette = 'e056fd'), 'clouds')+
+Map$addLayer(cloudmask, visParams = list(palette = 'orange'), 'cloudmask')+
+Map$addLayer(shadows, visParams = list(palette = 'yellow'), 'shadows')+
+Map$addLayer(img, visParams = list(bands =  c('B4', 'B3', 'B2'), min = 0, max = 2500), 'S2Image')
+Map$centerObject(WD$geometry())
+
+# cmask = py_to_r(py$is2_ESA)
+# Map$addLayer(sr_jan_2021_med, rgbvis, 'median')
+# Map$addLayer(is_c, cloudvis, 'cloud')
+# Map$addLayer(mask,vis, 'mask')
+
+```
+```{r}
+img_02 = ee_as_raster(
+  image = jan_2021_cloudfree_clip ,
+  region = WD$geometry(),
+  via = "drive"
+)
+
+
+```
+
+
+
+```{r, results = hold}
+clouds  = py_to_r(py$clouds)
+cloudmask = py_to_r(py$cloudmask)
+shadows = py_to_r(py$shadows)
+img =  py_to_r(py$img)
+# sr_jan_2021 = py_to_r(py$s2_sr_jan_2021)
+jan_2021_cloudfree = py_to_r(py$s2_sr_median)
+jan_2021_cloudfree_clip = jan_2021_cloudfree$clip(WD)
+jan_2021_cloudfree_reduce = jan_2021_cloudfree_clip
+
+# Map$addLayer(jan_2021_cloudfree_clip, rgbvis, 'S2SR Cloud Free Composite')+
+# Map$addLayer(jan_2021_cloudfree_clip, falsevis, 'S2SR Cloud Free False Colour')
+# Map$centerObject(WD$geometry())
+
+
+Map$addLayer(clouds, visParams = list(palette = 'e056fd'), 'clouds')+
+Map$addLayer(cloudmask, visParams = list(palette = 'orange'), 'cloudmask')+
+Map$addLayer(shadows, visParams = list(palette = 'yellow'), 'shadows')+
+Map$addLayer(img, visParams = list(bands =  c('B4', 'B3', 'B2'), min = 0, max = 2500), 'S2Image')
+Map$centerObject(WD$geometry())
+
+# cmask = py_to_r(py$is2_ESA)
+# Map$addLayer(sr_jan_2021_med, rgbvis, 'median')
+# Map$addLayer(is_c, cloudvis, 'cloud')
+# Map$addLayer(mask,vis, 'mask')
+
+```
+
+
+
+
+
+```{python, EE 01/2021}
+import os
+import ee
+import fiona 
+import geemap
+import geetools
+
+
+
+shp = fiona.open("D:/OFWD Project/Data/Spatial Data/Geoscience AU(Catchment + Surface Water)/Non-GDB Shapefiles/Catchments WA/Warren & Donnelly River Catchments/Warren_Donnelly_WGS_Diss.shp")
+
+geom = shp.bounds
+geom_list = list(geom)
+
+AOI = geemap.shp_to_ee("D:/OFWD Project/Data/Spatial Data/Geoscience AU(Catchment + Surface Water)/Non-GDB Shapefiles/Catchments WA/Warren & Donnelly River Catchments/Warren_Donnelly_UTM_Diss.shp")
+
+
+START_DATE = '2021-01-01'
+END_DATE = '2021-03-31'
+CLOUD_FILTER = 60
+CLD_PRB_THRESH = 50
+NIR_DRK_THRESH = 0.15
+CLD_PRJ_DIST = 1
+BUFFER = 50
+
+def get_s2_sr_cld_col(AOI, START_DATE, END_DATE):
+    # Import and filter S2 SR.
+    s2_sr_col = (ee.ImageCollection('COPERNICUS/S2_SR')
+        .filterBounds(AOI)
+        .filterDate(START_DATE, END_DATE)
+        .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER)))
+    clip_sr_col =  s2_sr_col.map(lambda image: image.clip(AOI))     
+    # Import and filter s2cloudless.
+    s2_cloudless_col = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+        .filterBounds(AOI)
+        .filterDate(START_DATE, END_DATE))
+    clip_cloudless_col = s2_cloudless_col.map(lambda image: image.clip(AOI))    
+    # Join the filtered s2cloudless collection to the SR collection by the 'system:index' property.
+    return ee.ImageCollection(ee.Join.saveFirst('s2cloudless').apply(**{
+        'primary': clip_sr_col,
+        'secondary': clip_cloudless_col,
+        'condition': ee.Filter.equals(**{
+            'leftField': 'system:index',
+            'rightField': 'system:index'
+        })
+    }))
+
+
+s2_sr_cld_col_eval = get_s2_sr_cld_col(AOI, START_DATE, END_DATE)
+
+
+def add_cloud_bands(img):
+    # Get s2cloudless image, subset the probability band.
+    cld_prb = ee.Image(img.get('s2cloudless')).select('probability')
+    # Condition s2cloudless by the probability threshold value.
+    is_cloud = cld_prb.gt(CLD_PRB_THRESH).rename('clouds')
+    # Add the cloud probability layer and cloud mask as image bands.
+    return img.addBands(ee.Image([cld_prb, is_cloud]))
+
+def add_shadow_bands(img):
+    # Identify water pixels from the SCL band.
+    not_water = img.select('SCL').neq(6)
+    # Identify dark NIR pixels that are not water (potential cloud shadow pixels).
+    SR_BAND_SCALE = 1e4
+    dark_pixels = img.select('B8').lt(NIR_DRK_THRESH*SR_BAND_SCALE).multiply(not_water).rename('dark_pixels')
+    # Determine the direction to project cloud shadow from clouds (assumes UTM projection).
+    shadow_azimuth = ee.Number(90).subtract(ee.Number(img.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+    # Project shadows from clouds for the distance specified by the CLD_PRJ_DIST input.
+    cld_proj = (img.select('clouds').directionalDistanceTransform(shadow_azimuth, CLD_PRJ_DIST*10)
+        .reproject(**{'crs': img.select(0).projection(), 'scale': 100})
+        .select('distance')
+        .mask()
+        .rename('cloud_transform'))
+    # Identify the intersection of dark pixels with cloud shadow projection.
+    shadows = cld_proj.multiply(dark_pixels).rename('shadows')
+    # Add dark pixels, cloud projection, and identified shadows as image bands.
+    return img.addBands(ee.Image([dark_pixels, cld_proj, shadows]))
+
+def add_cld_shdw_mask(img):
+    # Add cloud component bands.
+    img_cloud = add_cloud_bands(img)
+    # Add cloud shadow component bands.
+    img_cloud_shadow = add_shadow_bands(img_cloud)
+    # Combine cloud and shadow mask, set cloud and shadow as value 1, else 0.
+    is_cld_shdw = img_cloud_shadow.select('clouds').add(img_cloud_shadow.select('shadows')).gt(0)
+    # Remove small cloud-shadow patches and dilate remaining pixels by BUFFER input.
+    # 20 m scale is for speed, and assumes clouds don't require 10 m precision.
+    is_cld_shdw = (is_cld_shdw.focal_min(2).focal_max(BUFFER*2/20)
+        .reproject(**{'crs': img.select([0]).projection(), 'scale': 20})
+        .rename('cloudmask'))
+    # Add the final cloud-shadow mask to the image.
+    return img_cloud_shadow.addBands(is_cld_shdw)
+
+
+
+s2_sr_cld_col_eval_disp = s2_sr_cld_col_eval.map(add_cld_shdw_mask)
+
+img = s2_sr_cld_col_eval_disp.mosaic()
+
+    # Subset layers and prepare them for display.
+clouds = img.select('clouds').selfMask()
+shadows = img.select('shadows').selfMask()
+dark_pixels = img.select('dark_pixels').selfMask()
+probability = img.select('probability')
+cloudmask = img.select('cloudmask').selfMask()
+cloud_transform = img.select('cloud_transform')
+
+s2_sr_cld_col = get_s2_sr_cld_col(AOI, START_DATE, END_DATE)
+
+def apply_cld_shdw_mask(img):
+    # Subset the cloudmask band and invert it so clouds/shadow are 0, else 1.
+    not_cld_shdw = img.select('cloudmask').Not()
+    # Subset reflectance bands and update their masks, return the result.
+    return img.select('B.*').updateMask(not_cld_shdw)
+  
+  
+  
+
+
+s2_sr_median = (s2_sr_cld_col.map(add_cld_shdw_mask)
+                             .map(apply_cld_shdw_mask)
+                             .median())
+                            
+# s2_sr_median_clip = s2_sr_median.clip(AOI)
+# QA60 = s2_sr_jan_2021.select(['QA60'])
+# 
+# fclouds = geetools.cloud_mask.sentinel2()
+# masked = fclouds(s2_sr_jan_2021.median())
+
+# task = geetools.batch.Export.image.toDrive(
+#             image=masked_layer,
+#             folder='MyFolder',
+#             scale=30,
+#             )
+# task.start()
+
+
+````
+```{r, results = hold}
+clouds  = py_to_r(py$clouds)
+cloudmask = py_to_r(py$cloudmask)
+shadows = py_to_r(py$shadows)
+img =  py_to_r(py$img)
+# sr_jan_2021 = py_to_r(py$s2_sr_jan_2021)
+jan_2021_cloudfree = py_to_r(py$s2_sr_median)
+jan_2021_cloudfree_clip = jan_2021_cloudfree$clip(cpes)
+jan_2021_cloudfree_clip$bandNames()$getInfo()
+
+
+red = jan_2021_cloudfree_clip$select('B4')
+red_m = red$selfMask()
+
+# expo = ee_as_raster(
+#   image = red,
+#   region = WD$geometry(),
+#   container = "rgee",
+#   scale = 10,
+#   crs = 'EPSG:32750',
+#   skipEmptyTiles = TRUE,
+#   via = "drive"
+# )
+
+
+expo = ee_image_to_drive(
+  image = red_m,
+  description = "red_01-03_2021_cloudfree",
+  folder = "rgee",
+  region = WD$geometry(),
+  crs = 'EPSG:32750',
+  maxPixels = 20000000000,
+  skipEmptyTiles = TRUE,
+  fileFormat = "GeoTIFF",
+)
+
+
+# Map$addLayer(jan_2021_cloudfree_clip, rgbvis, 'S2SR Cloud Free Composite')+
+# Map$addLayer(jan_2021_cloudfree_clip, falsevis, 'S2SR Cloud Free False Colour')
+# Map$centerObject(WD$geometry())
+
+
+# print(jan_2021_cloudfree_clip$bandNames)  
+
+# select = jan_2021_cloudfree_clip$select(c(paste0('B', 1:9), 'B8A', 'B11', 'B12'))
+# rescaled = select$divide(ee$Image$constant(10000))
+# 
+# maskedComposite = select$clip(cpes)
+# 
+# 
+# 
+# 
+# 
+# ndvi = maskedComposite$select('B8')$subtract(maskedComposite$select('B4'))$
+#         divide(maskedComposite$select('B8')$add(maskedComposite$select('B4')))
+# 
+# 
+# # Map$addLayer(cpes, {}, 'shp', FALSE)+
+# # Map$addLayer(ndvi, {}, 'NDVI')
+# # Map$centerObject(WD$geometry())
+# 
+# 
+# 
+# savi = maskedComposite$expression(
+#     expression = '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', 
+#     opt_map = list(
+#       'NIR' = maskedComposite$select('B8'),
+#       'RED' = maskedComposite$select('B4')
+# ))$rename('savi')
+# 
+# 
+# slavi = maskedComposite$expression(
+#     expression = 'NIR / (RED + SWIR)', 
+#     opt_map = list(
+#       'NIR' = maskedComposite$select('B8'),
+#       'RED' = maskedComposite$select('B4'),
+#       'SWIR' = maskedComposite$select('B12')
+# ))$rename('slavi')
+# 
+# 
+# pvr = maskedComposite$select('B3')$subtract(maskedComposite$select('B4'))$
+#         divide(maskedComposite$select('B3')$add(maskedComposite$select('B4')))
+# 
+# green = maskedComposite$select('B3')
+# 
+# Map$addLayer(green, {}, 'green')
+
+# Map$addLayer(cpes, {}, 'shp', FALSE)+
+# Map$addLayer(pvr, {}, 'pvr')+ 
+# Map$addLayer(slavi, {}, 'slavi')+
+# Map$addLayer(ndvi, {}, 'ndvi')
+# Map$addLayer(red, {}, 'green')
+# Map$centerObject(WD$geometry())
+
+# listOfImages = jan_2021_cloudfree_clip$toList(jan_2021_cloudfree_clip$size())
+# selected_images = ee$ImageCollection$fromImages(list(
+#                    ee$Image(listOfImages$get(3)), ee$Image(listOfImages$get(4)), 
+#                    ee$Image(listOfImages$get(5)), ee$Image(listOfImages$get(7)),
+#                    ee$Image(listOfImages$get(8)), ee$Image(listOfImages$get(12))))
+# 
+# mosaic = selected_images$mosaic()$clip(shp)                       
+
+
+
+
+# Map$addLayer(clouds, visParams = list(palette = 'e056fd'), 'clouds')+
+# Map$addLayer(cloudmask, visParams = list(palette = 'orange'), 'cloudmask')+
+# Map$addLayer(shadows, visParams = list(palette = 'yellow'), 'shadows')+
+# Map$addLayer(img, visParams = list(bands =  c('B4', 'B3', 'B2'), min = 0, max = 2500), 'S2Image')
+# Map$centerObject(WD$geometry())
+
+# cmask = py_to_r(py$is2_ESA)
+# Map$addLayer(sr_jan_2021_med, rgbvis, 'median')
+# Map$addLayer(is_c, cloudvis, 'cloud')
+# Map$addLayer(mask,vis, 'mask')
+```
+
+```{python, segementation}
+import os
+import ee
+import fiona 
+import geemap
+import geetools
+
+
+```
+
+
+
+
+
+
+```{r EE collection 02/2021}
+
+s2_sr_feb_2021 = ee$ImageCollection('COPERNICUS/S2_SR')$
+  filterBounds(WD)$
+  filterDate('2021-02-01', '2021-02-28')$
+  filter(ee$Filter$lt('CLOUD_COVERAGE_ASSESSMENT', 5))
+
+median_comp_feb_2021  = s2_sr_feb_2021$median()
+
+median_comp_feb_2021_WD= median_comp_feb_2021$clipToCollection(WD)
+median_comp_feb_2021_cpes = median_comp_feb_2021$clipToCollection(cpes)
+
+Map$addLayer(median_comp_feb_2021_WD, rgbvis, 'median')+
+Map$addLayer(median_comp_feb_2021_cpes, falsevis, 'median')
+Map$centerObject(WD$geometry())
+```
+
+
+```{r EE collection 03/2021}
+
+s2_sr_feb_2021 = ee$ImageCollection('COPERNICUS/S2_SR')$
+  filterBounds(WD)$
+  filterDate('2021-03-01', '2021-03-31')$
+  filter(ee$Filter$lt('CLOUD_COVERAGE_ASSESSMENT', 5))
+
+median_comp_mar_2021  = s2_sr_feb_2021$median()
+
+median_comp_mar_2021_WD= median_comp_mar_2021$clipToCollection(WD)
+median_comp_mar_2021_cpes = median_comp_mar_2021$clipToCollection(cpes)
+
+Map$addLayer(median_comp_mar_2021_WD, rgbvis, 'median')+
+Map$addLayer(median_comp_mar_2021_cpes, falsevis, 'median')
+Map$centerObject(WD$geometry())
+```
+
+
+```{r, results = hold}
+
+clouds  = py_to_r(py$clouds)
+cloudmask = py_to_r(py$cloudmask)
+shadows = py_to_r(py$shadows)
+img =  py_to_r(py$img)
+# sr_jan_2021 = py_to_r(py$s2_sr_jan_2021)
+jan_2021_cloudfree = py_to_r(py$s2_sr_median)
+jan_2021_cloudfree_clip = jan_2021_cloudfree$clip(WD)
+jan_2021_cloudfree_reduce = jan_2021_cloudfree_clip
+
+# Map$addLayer(jan_2021_cloudfree_clip, rgbvis, 'S2SR Cloud Free Composite')+
+# Map$addLayer(jan_2021_cloudfree_clip, falsevis, 'S2SR Cloud Free False Colour')
+# Map$centerObject(WD$geometry())
+
+
+Map$addLayer(clouds, visParams = list(palette = 'e056fd'), 'clouds')+
+Map$addLayer(cloudmask, visParams = list(palette = 'orange'), 'cloudmask')+
+Map$addLayer(shadows, visParams = list(palette = 'yellow'), 'shadows')+
+Map$addLayer(img, visParams = list(bands =  c('B4', 'B3', 'B2'), min = 0, max = 2500), 'S2Image')
+Map$centerObject(WD$geometry())
+
+# cmask = py_to_r(py$is2_ESA)
+# Map$addLayer(sr_jan_2021_med, rgbvis, 'median')
+# Map$addLayer(is_c, cloudvis, 'cloud')
+# Map$addLayer(mask,vis, 'mask')
+
+```
+
+
+
+```
+
+
